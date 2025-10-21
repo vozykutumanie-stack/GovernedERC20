@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title GovernedERC20 — ERC20 с ролями, pausability, permit (EIP-2612), snapshot и cap
+/// @notice Minting guarded by MINTER_ROLE, administrative actions by DEFAULT_ADMIN_ROLE
+/// @dev OpenZeppelin 4.x imports assumed
+import "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
+import "openzeppelin-contracts/contracts/access/AccessControl.sol";
+import "openzeppelin-contracts/contracts/security/Pausable.sol";
+import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
+
+contract GovernedERC20 is ERC20, ERC20Permit, ERC20Snapshot, AccessControl, Pausable, ReentrancyGuard {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant SNAPSHOT_ROLE = keccak256("SNAPSHOT_ROLE");
+    uint256 public immutable cap; // max total supply
+
+    event CapExceeded(uint256 attempted, uint256 cap);
+
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        uint256 cap_,
+        address admin,
+        address initialMinter
+    ) ERC20(name_, symbol_) ERC20Permit(name_) {
+        require(cap_ > 0, "cap==0");
+        cap = cap_;
+
+        // Grant roles
+        _setupRole(DEFAULT_ADMIN_ROLE, admin);
+        _setupRole(MINTER_ROLE, initialMinter);
+        _setupRole(SNAPSHOT_ROLE, admin);
+
+        // Optionally mint initial supply to admin (commented here)
+        // _mint(admin, initialSupply);
+    }
+
+    // ---- Mint / burn ----
+    /// @notice Mint new tokens (only MINTER_ROLE)
+    function mint(address to, uint256 amount) external whenNotPaused nonReentrant onlyRole(MINTER_ROLE) {
+        uint256 newSupply = totalSupply() + amount;
+        if (newSupply > cap) {
+            emit CapExceeded(newSupply, cap);
+            revert("cap exceeded");
+        }
+        _mint(to, amount);
+    }
+
+    /// @notice Burn tokens from caller
+    function burn(uint256 amount) external whenNotPaused nonReentrant {
+        _burn(_msgSender(), amount);
+    }
+
+    /// @notice Admin can burn from any account if approved (uses allowance)
+    function burnFrom(address account, uint256 amount) external whenNotPaused nonReentrant {
+        // standard allowance logic
+        uint256 currentAllowance = allowance(account, _msgSender());
+        require(currentAllowance >= amount, "burn amount exceeds allowance");
+        _approve(account, _msgSender(), currentAllowance - amount);
+        _burn(account, amount);
+    }
+
+    // ---- Snapshot ----
+    function snapshot() external onlyRole(SNAPSHOT_ROLE) returns (uint256) {
+        return _snapshot();
+    }
+
+    // ---- Pausable ----
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // ---- Overrides required by Solidity ----
+    function _beforeTokenTransfer(address from, address to, uint256 amount)
+        internal
+        override(ERC20, ERC20Snapshot)
+    {
+        super._beforeTokenTransfer(from, to, amount);
+        require(!paused(), "token transfer while paused"); // block transfers when paused
+    }
+
+    // permit and other hooks are correctly inherited via ERC20Permit
+
+    // The following functions are overrides required by Solidity for AccessControl compatibility
+    function supportsInterface(bytes4 interfaceId) public view override(AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+}
